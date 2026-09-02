@@ -45,7 +45,7 @@ def _verify_runtime():
 
 _verify_runtime()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -60,8 +60,11 @@ from chat_tools import (
     create_chat_session,
     list_chat_sessions,
     get_chat_messages,
+    get_session_owner,
     add_chat_message,
     delete_chat_session,
+    get_last_chart_url,
+    clear_last_chart_url,
 )
 
 
@@ -174,20 +177,24 @@ def create_session(req: SessionCreate):
 
 
 @app.get("/sessions/{session_id}/messages")
-def session_messages(session_id: str):
-    """加载某个会话的全部消息"""
+def session_messages(session_id: str, client_id: str):
+    """加载某个会话的全部消息（需带本人 client_id，防越权读取）"""
+    if get_session_owner(session_id) != client_id:
+        raise HTTPException(status_code=403, detail="forbidden")
     try:
-        return {"messages": get_chat_messages(session_id)}
+        return {"messages": get_chat_messages(session_id, client_id)}
     except Exception as e:
         return {"messages": [], "error": str(e)}
 
 
 @app.delete("/sessions/{session_id}")
-def remove_session(session_id: str):
-    """删除一个会话及其消息"""
+def remove_session(session_id: str, client_id: str):
+    """删除一个会话及其消息（需带本人 client_id，防越权删除）"""
+    if get_session_owner(session_id) != client_id:
+        raise HTTPException(status_code=403, detail="forbidden")
     try:
-        delete_chat_session(session_id)
-        return {"ok": True}
+        ok = delete_chat_session(session_id, client_id)
+        return {"ok": ok}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -214,6 +221,7 @@ async def chat(req: ChatRequest):
 
     async def gen():
         full = ""
+        clear_last_chart_url()  # 只记录本次请求真实生成的图
         try:
             async for chunk in get_chat_response(
                 req.query, history, req.model
@@ -222,6 +230,14 @@ async def chat(req: ChatRequest):
                     full += chunk
                     # 显式 yield utf-8 字节，避免 Starlette 默认按 latin-1 编码导致中文乱码
                     yield chunk.encode("utf-8")
+
+            # 正常完成：把本次真实生成的图表 URL 强制附到末尾，
+            # 避免模型自己编造不存在的 /static/xxx.png 导致前端破图。
+            last_url = get_last_chart_url()
+            if last_url and last_url not in full:
+                add_line = "\n\n![图表](" + last_url + ")\n"
+                full += add_line
+                yield add_line.encode("utf-8")
         except Exception as e:
             # 流式过程中出错：把错误也吐出去，前端能看到
             err_msg = f"\n\n[智能体出错] {type(e).__name__}: {e}"

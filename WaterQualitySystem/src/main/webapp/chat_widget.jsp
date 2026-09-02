@@ -383,14 +383,17 @@
 
   // ==================== 富文本渲染（图片 / 下载链接） ====================
   function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  // URL 白名单：只允许 http/https 外链与本站 /static/ 资源，其余一律拒绝，
+  // 防止模型/文本注入 javascript: 或破坏 HTML 属性。
   function absUrl(url) {
     url = (url || '').trim();
     if (/^https?:\/\//i.test(url)) return url;
-    if (url.indexOf('/') === 0) return CHAT_BASE + url;
-    return url;
+    if (/^\/static\//i.test(url)) return CHAT_BASE + url;
+    return '#';
   }
 
   function renderRich(text) {
@@ -468,7 +471,7 @@
 
   async function loadSession(sid) {
     try {
-      const r = await fetch(CHAT_BASE + '/sessions/' + sid + '/messages');
+      const r = await fetch(CHAT_BASE + '/sessions/' + sid + '/messages?client_id=' + encodeURIComponent(chatClientId));
       const j = await r.json();
       currentSessionId = sid;
       chatHistory = (j.messages || []).map(function (m) {

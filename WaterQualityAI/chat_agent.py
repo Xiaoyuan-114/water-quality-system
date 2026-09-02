@@ -104,21 +104,36 @@ async def get_chat_response(
     # 当前问题
     messages.append(HumanMessage(content=query))
 
-    # astream + stream_mode="messages" 直接流式输出 AI 消息
-    # 比 astream_events v2 轻量得多（不需要遍历整条链的所有事件）
-    # 工具调用时 LLM 会自动消化工具结果再总结，用户只看到最终文字
+    # astream + stream_mode="messages"。按“模型消息”缓冲：一条消息可能先流内容、
+    # 后才出现 tool_call_chunks（模型准备调工具前的前言/思考），所以直接把整条消息
+    # 攒起来，只有“不是工具调用消息”的那条（即最终回答）才放出去，
+    # 彻底避免把调工具前的中间文本（有时是泰文/英文乱入）吐给用户。
+    current_id = None
+    pending = ""
+    discard_msg = False
+
     async for msg, meta in agent.astream(
         {"messages": messages}, stream_mode="messages"
     ):
         if meta.get("langgraph_node") != "model":
             continue
+        mid = getattr(msg, "id", None)
+        if mid and mid != current_id:
+            # 上一条消息结束：若不丢弃则输出其累积文本
+            if pending and not discard_msg:
+                yield pending
+            current_id = mid
+            pending = ""
+            discard_msg = False
         content = getattr(msg, "content", "")
-        # 跳过带工具调用的模型消息（那是模型准备调工具前的中间文本/思考，用户不需要看），
-        # 只保留最终纯文本回答，避免出现"乱码前言"或把工具的中间过程吐给用户。
-        if getattr(msg, "tool_calls", None) or getattr(msg, "tool_call_chunks", None):
-            continue
         if content:
-            yield content
+            pending += content
+        if getattr(msg, "tool_calls", None) or getattr(msg, "tool_call_chunks", None):
+            discard_msg = True
+
+    # 收尾：输出最后一条非工具消息（即最终回答）
+    if pending and not discard_msg:
+        yield pending
 
 
 # ============================================================

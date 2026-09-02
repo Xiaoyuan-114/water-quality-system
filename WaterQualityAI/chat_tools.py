@@ -76,8 +76,23 @@ def _static_url(name: str) -> str:
     return "/static/" + name
 
 
-def _cleanup_static(max_age_seconds: int = 86400):
-    """清理超过 1 天的历史图表/导出文件，避免 static 目录无限增长"""
+# 记录最近本次请求生成/导出的图，供 /chat 在流式末尾强制附上真实 URL，
+# 避免模型自己编造一个不存在的图片链接导致前端破图。
+_last_chart_url = None
+
+
+def get_last_chart_url():
+    return _last_chart_url
+
+
+def clear_last_chart_url():
+    global _last_chart_url
+    _last_chart_url = None
+
+
+def _cleanup_static(max_age_seconds: int = 7 * 86400):
+    """清理超过 7 天的历史图表/导出文件。
+    保留期拉长，避免历史会话里引用的旧图/旧下载链接很快失效。"""
     now = time.time()
     try:
         for f in os.listdir(CHAT_STATIC_DIR):
@@ -328,6 +343,7 @@ def _mpl():
 
 
 def _save_fig(fig, prefix):
+    global _last_chart_url
     _cleanup_static()
     fn = f"{prefix}_{int(time.time())}.png"
     path = os.path.join(CHAT_STATIC_DIR, fn)
@@ -339,7 +355,9 @@ def _save_fig(fig, prefix):
             plt.close(fig)
         except Exception:
             pass
-    return _static_url(fn)
+    url = _static_url(fn)
+    _last_chart_url = url
+    return url
 
 
 def _chart_pie():
@@ -771,8 +789,23 @@ def list_chat_sessions(client_id: str, limit: int = 30) -> list:
         conn.close()
 
 
-def get_chat_messages(session_id: str) -> list:
-    """返回某会话的全部消息 [{role, content, created_at}]"""
+def get_session_owner(session_id: str):
+    """返回会话所属的 client_id；不存在返回 None"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT client_id FROM chat_session WHERE id=%s", (session_id,))
+            row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def get_chat_messages(session_id: str, client_id: str = None) -> list:
+    """返回某会话的全部消息 [{role, content, created_at}]。
+    传入 client_id 时做归属校验：不是同一 client 则返回空（防越权读取）。"""
+    if client_id is not None and get_session_owner(session_id) != client_id:
+        return []
     conn = _get_conn()
     try:
         with conn.cursor(pymysql.cursors.DictCursor) as cur:
@@ -810,14 +843,17 @@ def add_chat_message(session_id: str, role: str, content: str, update_title: boo
         conn.close()
 
 
-def delete_chat_session(session_id: str) -> None:
-    """删除会话及其消息"""
+def delete_chat_session(session_id: str, client_id: str = None) -> bool:
+    """删除会话及其消息。传入 client_id 时先校验归属，非本人返回 False。"""
+    if client_id is not None and get_session_owner(session_id) != client_id:
+        return False
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM chat_message WHERE session_id=%s", (session_id,))
             cur.execute("DELETE FROM chat_session WHERE id=%s", (session_id,))
         conn.commit()
+        return True
     finally:
         conn.close()
 
