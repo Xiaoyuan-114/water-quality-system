@@ -15,7 +15,7 @@ import json
 import os
 from datetime import datetime
 
-from data_preprocess import transform_data
+from data_preprocess import FEATURE_COLUMNS
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -40,23 +40,44 @@ app.add_middleware(
 # 切换到脚本所在目录，确保相对路径正确（无论从哪里启动都能找到模型文件）
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
+# best_model.pkl 是完整 Pipeline（中位数填充 + 标准化 + Voting 集成），
+# 与训练脚本保存的对象同一个，推理端不再手工拼接预处理步骤
 model = joblib.load("best_model.pkl")
-imputer = joblib.load("imputer.pkl")
-scaler = joblib.load("scaler.pkl")
-selector = joblib.load("selector.pkl")
 threshold = joblib.load("best_threshold.pkl")
 
+# 概率标定曲线（sigmoid/Platt，拟合于训练集袋外概率）。
+# 单独一个文件而不是把 CalibratedClassifierCV 打进模型里，是因为后者会把整个集成
+# 按 cv 复制多份（实测 128 MB，超过 GitHub 单文件 100 MB 限制）；
+# sigmoid 严格单调，不改变排序与 AUC，只把概率刻度摊开，
+# 让 water_grade 的 Good/Excellent 与 standard_level 的饮用水档真正可达。
+calibrator = joblib.load("probability_calibrator.pkl")
+
+
+def _load_metrics():
+    """
+    模型指标一律来自训练产物 model_metrics.json，不在源码里写死，
+    避免重新训练后接口还在汇报旧数字。
+    """
+    try:
+        with open("model_metrics.json", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "缺少 model_metrics.json，请先运行 python model_train.py 重新训练"
+        )
+
+
+MODEL_METRICS = _load_metrics()
+PRODUCTION_MODEL = MODEL_METRICS["生产模型"]
+# 主口径是重复交叉验证均值（单次留出受 656 行样本噪声影响太大）
+CV_METRICS = MODEL_METRICS["交叉验证指标"]
+HOLDOUT_METRICS = MODEL_METRICS["留出测试集指标"]
+
 # 加载特征重要性
-try:
-    feature_importance_df = joblib.load("feature_importance.pkl")
-except:
-    feature_importance_df = None
+feature_importance_df = joblib.load("feature_importance.pkl")
 
 # 加载模型评估结果
-try:
-    model_eval_df = pd.read_csv("model_evaluation.csv")
-except:
-    model_eval_df = None
+model_eval_df = pd.read_csv("model_evaluation.csv")
 
 # 模型描述信息（体现国际前沿趋势 - AI引论要求）
 MODEL_DESCRIPTIONS = {
@@ -92,7 +113,7 @@ MODEL_DESCRIPTIONS = {
     },
     "集成学习Voting": {
         "type": "模型融合",
-        "description": "Soft Voting策略融合RF+SVM+LightGBM三个模型",
+        "description": "Soft Voting融合SVM+随机森林，再用sigmoid做概率标定",
         "international_context": "多模型融合是当前AI前沿趋势，Gartner预测2025年70%的环境AI系统将采用集成方法"
     },
 }
@@ -144,11 +165,35 @@ class BatchWaterData(BaseModel):
 # ============================================================
 # 核心预测逻辑
 # ============================================================
+def _sample_values(sample: "WaterQualityData") -> Dict[str, float]:
+    """API 字段名（小写）→ 训练特征名（原始列名）"""
+    return {
+        "ph": sample.pH,
+        "Hardness": sample.hardness,
+        "Solids": sample.solids,
+        "Chloramines": sample.chloramines,
+        "Sulfate": sample.sulfate,
+        "Conductivity": sample.conductivity,
+        "Organic_carbon": sample.organic_carbon,
+        "Trihalomethanes": sample.trihalomethanes,
+        "Turbidity": sample.turbidity,
+    }
+
+
+def _to_feature_frame(values: Dict[str, float]) -> pd.DataFrame:
+    """按训练时的列名与列序构造输入，列错位会在预处理阶段直接报错"""
+    return pd.DataFrame([values], columns=FEATURE_COLUMNS)
+
+
 def make_prediction(input_data: pd.DataFrame) -> Dict[str, Any]:
     """核心预测函数，返回完整预测结果"""
-    X_processed = transform_data(input_data, imputer, scaler, selector)
+    # 按训练时的列序取列：缺列抛 KeyError，列序不同则静默纠正，
+    # 避免 sklearn 只给 warning 后按位置错配特征
+    input_data = input_data[FEATURE_COLUMNS]
 
-    probability = float(model.predict_proba(X_processed)[0][1])
+    # best_model.pkl 内含中位数填充 + 标准化 + 集成，这里不再手工预处理
+    raw_probability = float(model.predict_proba(input_data)[0][1])
+    probability = float(calibrator.predict([raw_probability])[0])
 
     prediction = 1 if probability >= threshold else 0
     prediction_text = "Safe" if prediction == 1 else "Unsafe"
@@ -187,10 +232,15 @@ def make_prediction(input_data: pd.DataFrame) -> Dict[str, Any]:
         "prediction": prediction_text,
         "probability": round(probability, 4),
         "threshold": round(threshold, 4),
+        # 安全门会覆盖模型判定，不把这个字段暴露出来的话，
+        # 调用方无法区分"模型说不安全"和"模型说安全但被规则拦下"
+        "ml_prediction": "Safe" if prediction == 1 else "Unsafe",
+        "safety_gate_triggered": not hard_safe,
+        "safety_gate_reason": hard_reason,
         "water_grade": grade,
         "wqi_score": round(wqi, 2),
         "standard_level": standard_level,
-        "model_name": "VotingEnsemble",
+        "model_name": PRODUCTION_MODEL,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -268,15 +318,20 @@ def _calculate_wqi(input_data: pd.DataFrame) -> float:
 
 @app.get("/")
 def health():
-    """健康检查"""
+    """健康检查（指标读自 model_metrics.json，重新训练后自动同步）"""
     return {
         "status": "online",
-        "service": "Water Quality AI Prediction API",
+        "service": "Water Quality AI Prediction Service",
         "version": "2.0.0",
-        "model": "VotingEnsemble (RF+SVM+LightGBM)",
-        "model_accuracy": "58.99%",
-        "model_f1": "0.5239",
-        "model_auc": "0.6615",
+        "model": PRODUCTION_MODEL,
+        "model_accuracy": CV_METRICS["准确率"],
+        "model_f1": CV_METRICS["F1-Score"],
+        "model_auc": CV_METRICS["AUC"],
+        "accuracy_sem": CV_METRICS["准确率_sem"],
+        "auc_sem": CV_METRICS["AUC_sem"],
+        "holdout_accuracy": HOLDOUT_METRICS["准确率"],
+        "threshold": round(float(threshold), 4),
+        "evaluation": MODEL_METRICS["主口径"],
         "timestamp": datetime.now().isoformat()
     }
 
@@ -288,17 +343,7 @@ def predict_single(data: WaterQualityData):
     返回预测结果、概率、水质等级、WQI指数等完整信息
     """
     try:
-        input_data = pd.DataFrame([{
-            "ph": data.pH,
-            "Hardness": data.hardness,
-            "Solids": data.solids,
-            "Chloramines": data.chloramines,
-            "Sulfate": data.sulfate,
-            "Conductivity": data.conductivity,
-            "Organic_carbon": data.organic_carbon,
-            "Trihalomethanes": data.trihalomethanes,
-            "Turbidity": data.turbidity
-        }])
+        input_data = _to_feature_frame(_sample_values(data))
 
         result = make_prediction(input_data)
         return result
@@ -316,17 +361,7 @@ def predict_batch(data: BatchWaterData):
     try:
         results = []
         for sample in data.samples:
-            input_data = pd.DataFrame([{
-                "ph": sample.pH,
-                "Hardness": sample.hardness,
-                "Solids": sample.solids,
-                "Chloramines": sample.chloramines,
-                "Sulfate": sample.sulfate,
-                "Conductivity": sample.conductivity,
-                "Organic_carbon": sample.organic_carbon,
-                "Trihalomethanes": sample.trihalomethanes,
-                "Turbidity": sample.turbidity
-            }])
+            input_data = _to_feature_frame(_sample_values(sample))
             result = make_prediction(input_data)
             results.append(result)
 
@@ -345,37 +380,37 @@ def predict_batch(data: BatchWaterData):
 def get_model_info():
     """
     获取所有AI模型的评估信息
-    从model_evaluation.csv和内置描述中构建完整信息
+    全部取自训练产物 model_evaluation.csv / model_metrics.json，
+    源码内不留任何手写指标
     """
     try:
         models_info = []
-        if model_eval_df is not None:
-            for _, row in model_eval_df.iterrows():
-                model_name = row['模型']
-                desc = MODEL_DESCRIPTIONS.get(model_name, {})
-                models_info.append({
-                    "model_name": model_name,
-                    "model_type": desc.get("type", "未分类"),
-                    "accuracy": round(float(row['准确率']), 4),
-                    "f1_score": round(float(row['F1-Score']), 4),
-                    "auc": round(float(row['AUC']), 4),
-                    "cv_f1_mean": round(float(row['交叉验证F1']), 4),
-                    "description": desc.get("description", ""),
-                    "international_context": desc.get("international_context", "")
-                })
-        else:
-            # 如果没有CSV文件，返回内置数据
-            models_info = [
-                {"model_name": "集成学习Voting", "model_type": "模型融合",
-                 "accuracy": 0.5899, "f1_score": 0.5239, "auc": 0.6615, "cv_f1_mean": 0.7448,
-                 "description": "Soft Voting策略融合RF+SVM+LightGBM",
-                 "international_context": "多模型融合是当前AI前沿趋势"},
-            ]
+        for _, row in model_eval_df.iterrows():
+            model_name = row['模型']
+            desc = MODEL_DESCRIPTIONS.get(model_name, {})
+            models_info.append({
+                "model_name": model_name,
+                "model_type": desc.get("type", "未分类"),
+                "accuracy": round(float(row['准确率']), 4),
+                "f1_score": round(float(row['F1-Score']), 4),
+                "auc": round(float(row['AUC']), 4),
+                "precision": round(float(row['精确率']), 4),
+                "recall": round(float(row['召回率']), 4),
+                "cv_auc": round(float(row['交叉验证AUC']), 4),
+                "cv_f1_mean": round(float(row['交叉验证F1']), 4),
+                "threshold": round(float(row['阈值']), 4),
+                "is_production": model_name == PRODUCTION_MODEL,
+                "evaluation_protocol": str(row['评估协议']),
+                "is_baseline": str(row['参与评选']) != "是",
+                "description": desc.get("description", ""),
+                "international_context": desc.get("international_context", "")
+            })
 
         current_model = {
-            "name": "VotingEnsemble",
+            "name": PRODUCTION_MODEL,
             "type": "集成学习",
-            "components": ["RandomForest", "SVM", "LightGBM"],
+            "components": MODEL_METRICS["生产模型成员"],
+            "calibration": MODEL_METRICS.get("概率标定"),
             "threshold": round(float(threshold), 4)
         }
 
@@ -383,8 +418,11 @@ def get_model_info():
             "models": models_info,
             "current_model": current_model,
             "total_models": len(models_info),
-            "production_model": "集成学习Voting",
-            "data_source": "water_potability.csv (3276 samples)",
+            "production_model": PRODUCTION_MODEL,
+            "data_source": MODEL_METRICS["数据集"],
+            "evaluation_protocol": MODEL_METRICS["主口径"],
+            "holdout_protocol": MODEL_METRICS["辅助口径"],
+            "majority_baseline_accuracy": MODEL_METRICS["多数类基线准确率"],
             "timestamp": datetime.now().isoformat()
         }
 
@@ -399,30 +437,18 @@ def get_model_explain():
     支持XAI可解释AI，满足AI引论课程的系统思维要求
     """
     try:
-        if feature_importance_df is not None:
-            features = []
-            for _, row in feature_importance_df.iterrows():
-                features.append({
-                    "feature": str(row['特征']),
-                    "importance": float(row['重要性']),
-                    "importance_pct": round(float(row['重要性']) * 100, 2)
-                })
-        else:
-            features = [
-                {"feature": "pH", "importance": 0.15, "importance_pct": 15.0},
-                {"feature": "Hardness", "importance": 0.12, "importance_pct": 12.0},
-                {"feature": "Solids", "importance": 0.11, "importance_pct": 11.0},
-                {"feature": "Chloramines", "importance": 0.13, "importance_pct": 13.0},
-                {"feature": "Sulfate", "importance": 0.10, "importance_pct": 10.0},
-                {"feature": "Conductivity", "importance": 0.10, "importance_pct": 10.0},
-                {"feature": "Organic_carbon", "importance": 0.11, "importance_pct": 11.0},
-                {"feature": "Trihalomethanes", "importance": 0.09, "importance_pct": 9.0},
-                {"feature": "Turbidity", "importance": 0.09, "importance_pct": 9.0}
-            ]
+        features = [
+            {
+                "feature": str(row['特征']),
+                "importance": float(row['重要性']),
+                "importance_pct": round(float(row['重要性']) * 100, 2)
+            }
+            for _, row in feature_importance_df.iterrows()
+        ]
 
         return {
             "features": sorted(features, key=lambda x: x['importance'], reverse=True),
-            "method": "RandomForest Feature Importance (Mean Decrease Impurity)",
+            "method": MODEL_METRICS["特征重要性来源"],
             "note": "特征重要性越高，对水质判断影响越大",
             "timestamp": datetime.now().isoformat()
         }
@@ -449,12 +475,7 @@ def comprehensive_analyze(data: WaterQualityData):
     体现多维度系统思维（AI引论要求）
     """
     try:
-        input_data = pd.DataFrame([{
-            "ph": data.pH, "Hardness": data.hardness, "Solids": data.solids,
-            "Chloramines": data.chloramines, "Sulfate": data.sulfate,
-            "Conductivity": data.conductivity, "Organic_carbon": data.organic_carbon,
-            "Trihalomethanes": data.trihalomethanes, "Turbidity": data.turbidity
-        }])
+        input_data = _to_feature_frame(_sample_values(data))
 
         # AI预测
         prediction_result = make_prediction(input_data)
@@ -487,9 +508,9 @@ def comprehensive_analyze(data: WaterQualityData):
             suggestions.append("⚠️ 水质检测结果不安全，建议立即停止饮用并进行深度处理")
             if data.turbidity > 5:
                 suggestions.append("浊度超标，建议增加过滤和沉淀处理环节")
-            if data.ph < 6.5:
+            if data.pH < 6.5:
                 suggestions.append("pH偏酸，建议添加碱性中和剂")
-            elif data.ph > 8.5:
+            elif data.pH > 8.5:
                 suggestions.append("pH偏碱，建议添加酸性中和剂")
         elif prediction_result["probability"] < 0.7:
             suggestions.append("水质处于临界状态，建议增加净化处理并定期复查")
@@ -518,17 +539,18 @@ def get_dashboard_summary():
     try:
         return {
             "model_overview": {
-                "active_model": "集成学习Voting",
-                "model_components": ["RandomForest", "SVM", "LightGBM"],
-                "accuracy": 0.5899,
-                "f1_score": 0.5239,
-                "auc": 0.6615,
+                "active_model": PRODUCTION_MODEL,
+                "model_components": MODEL_METRICS["生产模型成员"],
+                "accuracy": CV_METRICS["准确率"],
+                "f1_score": CV_METRICS["F1-Score"],
+                "auc": CV_METRICS["AUC"],
+                "precision": CV_METRICS["精确率"],
+                "recall": CV_METRICS["召回率"],
+                "holdout_accuracy": HOLDOUT_METRICS["准确率"],
+                "majority_baseline_accuracy": MODEL_METRICS["多数类基线准确率"],
                 "threshold": round(float(threshold), 4)
             },
-            "features_used": [
-                "pH", "Hardness", "Solids", "Chloramines", "Sulfate",
-                "Conductivity", "Organic_carbon", "Trihalomethanes", "Turbidity"
-            ],
+            "features_used": FEATURE_COLUMNS,
             "prediction_classes": ["Safe", "Unsafe"],
             "water_grades": ["Excellent", "Good", "Fair", "Poor", "Dangerous"],
             "timestamp": datetime.now().isoformat()
