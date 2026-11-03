@@ -71,6 +71,20 @@ water_ai_env\Scripts\python ai_api.py
   现在响应里用 `ml_prediction` / `safety_gate_triggered` / `safety_gate_reason` 把两者分工暴露出来，
   真要修的是阈值与数据单位口径，不是模型。
 
+## Repo layout（整理后的约定）
+
+- `WaterQualitySystem/src/main/webapp/images/` **只放被 JSP 引用的图**（现在是 `model_comparison.png`
+  和 `feature_importance.png`）。这两张是 `WaterQualityAI/` 训练产物的副本，由
+  `model_train.py` 的 `sync_webapp_images()` 在每次训练后自动覆盖，不要手改手拷。
+- 截图、架构图、ER 图等答辩/文档素材统一放 `docs/assets/`，文件名用英文小写连字符
+  （`system-architecture.png`、`db-schema.png`、`mysql-er-diagram.png`、`preview.png`），
+  不要再往 webapp 目录或 `mysql/` 里塞图片。
+- `mysql/` 只留对外有意义的两份：建库种子 `water_quality_db.sql`、手册 `backup_manual.sql`；
+  一次性迁移脚本（改密码哈希、重建用户表、更新团队信息）放 `mysql/tools/`。
+- 孤儿产物已删：`iso_forest.pkl`、`lstm_model.h5`（对应模型因指标未经真实评估早就不在仪表盘上了），
+  以及被 Pipeline 吸收掉的 `imputer/scaler/selector/selected_features/smote.pkl`。
+  要找回任意一个：`git show <旧提交>:<路径> > 文件名`。
+
 ## Before editing code
 - For risky changes, branch first: `git checkout -b <name>` → work → merge back → delete branch
 - User prefers: explain the design plan first, then implement after approval

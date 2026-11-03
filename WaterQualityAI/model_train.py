@@ -28,6 +28,7 @@
 import json
 import os
 import platform
+import shutil
 import warnings
 from datetime import datetime
 
@@ -416,6 +417,27 @@ def artifact_size(path):
     return round(os.path.getsize(path) / 1e6, 3) if os.path.exists(path) else None
 
 
+# model_info.jsp 只能引用 WAR 内的图片，所以这两张图在仓库里有第二份。
+# 靠人手复制必然漂移（曾经网页上挂的就是训练前的旧对比图），交给训练脚本同步。
+WEBAPP_IMAGE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "WaterQualitySystem", "src", "main", "webapp", "images",
+)
+WEBAPP_SYNCED_IMAGES = ["model_comparison.png", "feature_importance.png"]
+
+
+def sync_webapp_images():
+    """把前端会引用的图同步到 WAR 目录。"""
+    for name in WEBAPP_SYNCED_IMAGES:
+        src = os.path.abspath(name)
+        dst = os.path.join(WEBAPP_IMAGE_DIR, name)
+        if os.path.exists(src):
+            shutil.copyfile(src, dst)
+            print(f"已同步 WAR 图片：{name} -> {dst}")
+        else:
+            print(f"警告：缺少 {src}，WAR 里的 {name} 仍是旧版")
+
+
 def main():
     print("数据集路径:", DATA_FILE)
     df = load_data(DATA_FILE)
@@ -528,6 +550,7 @@ def main():
           f"（全量5折袋外宏平均F1={macro_f1:.4f}）")
 
     importance = analyze_feature_importance(X, y)
+    sync_webapp_images()
 
     hold, hold_proba, _ = holdouts[production]
     production_cv = summarize(folds[production])
