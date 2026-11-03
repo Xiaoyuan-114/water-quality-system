@@ -278,14 +278,26 @@ CREATE TABLE `ai_model_info` (
   INDEX `idx_model_type`(`model_type` ASC) USING BTREE
 ) ENGINE=InnoDB AUTO_INCREMENT=12 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI模型评估信息表' ROW_FORMAT=Dynamic;
 
-INSERT INTO `ai_model_info` VALUES (1, '决策树', 'traditional', 0.5168, 0.5359, 0.5954, 0.5200, 0.5530, 0.5948, 0.52, 0, '2026-05-13 23:08:23');
-INSERT INTO `ai_model_info` VALUES (2, '随机森林', 'traditional', 0.5686, 0.5795, 0.6763, 0.5750, 0.5840, 0.6618, 0.48, 0, '2026-05-13 23:08:23');
-INSERT INTO `ai_model_info` VALUES (3, 'SVM', 'traditional', 0.5945, 0.5333, 0.6390, 0.6000, 0.4800, 0.7239, 0.45, 0, '2026-05-13 23:08:23');
-INSERT INTO `ai_model_info` VALUES (4, '梯度提升树', 'traditional', 0.5655, 0.5790, 0.6440, 0.5700, 0.5880, 0.6239, 0.50, 0, '2026-05-13 23:08:23');
-INSERT INTO `ai_model_info` VALUES (5, 'XGBoost', 'traditional', 0.5884, 0.5230, 0.6327, 0.5950, 0.4660, 0.6791, 0.45, 0, '2026-05-13 23:08:23');
-INSERT INTO `ai_model_info` VALUES (6, 'LightGBM', 'traditional', 0.5915, 0.5214, 0.6491, 0.5980, 0.4630, 0.7045, 0.46, 0, '2026-05-13 23:08:23');
-INSERT INTO `ai_model_info` VALUES (7, '集成学习Voting', 'ensemble', 0.5899, 0.5239, 0.6615, 0.6100, 0.4580, 0.7448, 0.50, 1, '2026-05-13 23:08:23');
+-- 指标来源：WaterQualityAI/model_train.py 的 5折x3次重复交叉验证（全量3276条），
+-- 每折在自身训练部分内部完成概率标定与定阈值，测试集不参与选择。
+-- 与 WaterQualityAI/model_evaluation.csv 逐行一致；重训模型后需同步这里。
+INSERT INTO `ai_model_info` VALUES (1, '决策树', 'traditional', 0.6195, 0.4128, 0.5962, 0.5268, 0.3498, 0.4128, 0.392, 0, '2026-11-03 16:50:32');
+INSERT INTO `ai_model_info` VALUES (2, '随机森林', 'traditional', 0.6584, 0.5390, 0.6868, 0.5726, 0.5133, 0.5390, 0.428, 0, '2026-11-03 16:50:32');
+INSERT INTO `ai_model_info` VALUES (3, 'SVM', 'traditional', 0.6607, 0.5540, 0.6956, 0.5693, 0.5412, 0.5540, 0.427, 0, '2026-11-03 16:50:32');
+INSERT INTO `ai_model_info` VALUES (4, '梯度提升树', 'traditional', 0.6257, 0.4899, 0.6478, 0.5267, 0.4637, 0.4899, 0.403, 0, '2026-11-03 16:50:32');
+INSERT INTO `ai_model_info` VALUES (5, 'XGBoost', 'traditional', 0.6348, 0.5111, 0.6639, 0.5405, 0.4917, 0.5111, 0.416, 0, '2026-11-03 16:50:32');
+INSERT INTO `ai_model_info` VALUES (6, 'LightGBM', 'traditional', 0.6427, 0.5123, 0.6691, 0.5496, 0.4828, 0.5123, 0.425, 0, '2026-11-03 16:50:32');
+INSERT INTO `ai_model_info` VALUES (7, '集成学习Voting', 'ensemble', 0.6641, 0.5573, 0.7025, 0.5766, 0.5433, 0.5573, 0.440, 1, '2026-11-03 16:50:32');
 -- LSTM 和 IsolationForest 模型已移除：指标未经真实评估，不应出现在仪表盘中
+--
+-- 已经建过库的环境不要重跑整个脚本，执行下面这组语句同步模型表即可：
+--   UPDATE `ai_model_info` SET accuracy=0.6195, f1_score=0.4128, auc=0.5962, precision_score=0.5268, recall_score=0.3498, cv_f1_mean=0.4128, best_threshold=0.392, create_time='2026-11-03 16:50:32' WHERE id=1;
+--   UPDATE `ai_model_info` SET accuracy=0.6584, f1_score=0.5390, auc=0.6868, precision_score=0.5726, recall_score=0.5133, cv_f1_mean=0.5390, best_threshold=0.428, create_time='2026-11-03 16:50:32' WHERE id=2;
+--   UPDATE `ai_model_info` SET accuracy=0.6607, f1_score=0.5540, auc=0.6956, precision_score=0.5693, recall_score=0.5412, cv_f1_mean=0.5540, best_threshold=0.427, create_time='2026-11-03 16:50:32' WHERE id=3;
+--   UPDATE `ai_model_info` SET accuracy=0.6257, f1_score=0.4899, auc=0.6478, precision_score=0.5267, recall_score=0.4637, cv_f1_mean=0.4899, best_threshold=0.403, create_time='2026-11-03 16:50:32' WHERE id=4;
+--   UPDATE `ai_model_info` SET accuracy=0.6348, f1_score=0.5111, auc=0.6639, precision_score=0.5405, recall_score=0.4917, cv_f1_mean=0.5111, best_threshold=0.416, create_time='2026-11-03 16:50:32' WHERE id=5;
+--   UPDATE `ai_model_info` SET accuracy=0.6427, f1_score=0.5123, auc=0.6691, precision_score=0.5496, recall_score=0.4828, cv_f1_mean=0.5123, best_threshold=0.425, create_time='2026-11-03 16:50:32' WHERE id=6;
+--   UPDATE `ai_model_info` SET accuracy=0.6641, f1_score=0.5573, auc=0.7025, precision_score=0.5766, recall_score=0.5433, cv_f1_mean=0.5573, best_threshold=0.440, is_production=1, create_time='2026-11-03 16:50:32' WHERE id=7;
 
 -- ============================================================
 -- 10. 系统公告表
@@ -309,7 +321,7 @@ CREATE TABLE `announcement` (
 ) ENGINE=InnoDB AUTO_INCREMENT=8 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统公告表' ROW_FORMAT=Dynamic;
 
 INSERT INTO `announcement` VALUES (1, '水质检测系统V2.0上线通知', '智能水质检测系统V2.0版本正式上线，新增7种机器学习模型对比分析、水源管理等功能，欢迎使用。', '系统重大更新', 'system', '2026-05-13 23:08:23', 1, 1, 128);
-INSERT INTO `announcement` VALUES (2, 'AI模型升级预告', '集成学习Voting模型已通过测试，F1-Score达0.75（交叉验证），即将切换为生产模型。', '模型升级', 'model', '2026-05-13 23:08:23', 1, 0, 56);
+INSERT INTO `announcement` VALUES (2, 'AI模型升级说明', '生产模型已切换为集成学习Voting（SVM+随机森林 soft voting，sigmoid 概率标定）。5折x3次重复交叉验证：准确率0.664、F1 0.557、AUC 0.703；旧线上模型同口径为0.627、0.538、0.672。', '模型升级', 'model', '2026-11-03 16:50:32', 1, 0, 56);
 INSERT INTO `announcement` VALUES (3, '新增水质标准参考', '系统已更新至最新GB5749-2022《生活饮用水卫生标准》及GB3838-2002《地表水环境质量标准》。', '数据更新', 'standard', '2026-05-15 10:00:00', 1, 0, 34);
 INSERT INTO `announcement` VALUES (4, '水质检测操作指南', '本文档详细介绍如何使用系统的各项功能：水质检测、历史查询、数据分析、警告处理等。', '使用帮助', 'guide', '2026-05-15 10:00:00', 1, 0, 89);
 
