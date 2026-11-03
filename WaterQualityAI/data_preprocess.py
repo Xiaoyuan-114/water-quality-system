@@ -1,12 +1,20 @@
 import pandas as pd
 import numpy as np
+from sklearn.base import BaseEstimator
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import KNNImputer
-from sklearn.feature_selection import SelectKBest, f_classif
-import joblib
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
 
 # 注：matplotlib/seaborn 改为在 analyze_features() 内延迟 import，
-# 使推理路径（transform_data）不依赖可视化库
+# 使推理路径不依赖可视化库
+
+# 训练与推理共用的特征顺序，任何一侧单独改动都会让线上预测静默错位
+FEATURE_COLUMNS = [
+    "ph", "Hardness", "Solids", "Chloramines", "Sulfate",
+    "Conductivity", "Organic_carbon", "Trihalomethanes", "Turbidity",
+]
 
 
 # 1. 数据加载与基础清洗（仅去除重复值）
@@ -20,94 +28,65 @@ def load_data(file_path):
     return df
 
 
-# 2. 完整的预处理流程（仅在训练集上拟合）
-def fit_preprocessing(X_train, y_train, k_features=9, method='anova'):
+# 2. 生产预处理链
+#
+# 用 Pipeline 而不是散落的 imputer.pkl / scaler.pkl / selector.pkl：
+# 训练与推理共用同一个对象，杜绝"线上少做一步预处理"这类静默错位。
+#
+# 中位数填充替换了原来的 KNN 填充：同一随机森林配置下两者的袋外指标持平，
+# 而 KNNImputer 要把整份训练矩阵存进 pkl（旧 imputer.pkl 213 KB，
+# 对比 scaler 只有 783 B），并在每次预测时重新遍历它找邻居，代价换不来增益。
+def build_preprocessor():
 
-    # ==============================
-    # 1. 缺失值处理：KNN填充
-    # ==============================
-    imputer = KNNImputer(n_neighbors=5)
-
-    X_train_imputed = imputer.fit_transform(X_train)
-
-    # ==============================
-    # 2. 特征标准化
-    # ==============================
-    scaler = StandardScaler()
-
-    X_train_scaled = scaler.fit_transform(X_train_imputed)
-
-    # ==============================
-    # 3. 特征选择
-    # 注意：
-    # 原始数据只有9个特征
-    # 不适合复杂RFE
-    # 使用ANOVA更加稳定
-    # ==============================
-    if method == 'anova':
-
-        selector = SelectKBest(
-            score_func=f_classif,
-            k=k_features
-        )
-
-        X_train_selected = selector.fit_transform(
-            X_train_scaled,
-            y_train
-        )
-
-        selected_features = X_train.columns[
-            selector.get_support()
-        ]
-
-    else:
-        # 默认不做特征选择
-        selector = None
-
-        X_train_selected = X_train_scaled
-
-        selected_features = X_train.columns
-
-    # ==============================
-    # 保存预处理工具
-    # ==============================
-    joblib.dump(imputer, "imputer.pkl")
-    joblib.dump(scaler, "scaler.pkl")
-    joblib.dump(selector, "selector.pkl")
-    joblib.dump(selected_features, "selected_features.pkl")
-
-    return (
-        X_train_selected,
-        y_train,
-        imputer,
-        scaler,
-        selector,
-        selected_features
-    )
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
 
 
-# 3. 使用已拟合的预处理工具转换数据（用于测试集和新数据）
-def transform_data(X, imputer, scaler, selector):
+# 概率标定（Platt / sigmoid）
+#
+# 为什么不用 sklearn 的 IsotonicRegression：保序回归会在曲线上留下平台段，
+# 平台段把不同的原始概率压成同一个标定值，留出集上的排序被打乱，
+# 实测 AUC 掉约 0.01（与模型之间的差距同量级），等于拿指标损失换刻度好看。
+# sigmoid 严格单调，任何数据上的排序与 AUC 都和未标定完全一致。
+#
+# 斜率非正说明"概率越高反而越不像可饮用"，那必然是训练异常，
+# 此时退化为恒等变换，而不是把预测结果反向。
+class ProbabilityCalibrator(BaseEstimator):
 
-    # ==============================
-    # 1. 缺失值填充
-    # ==============================
-    X_imputed = imputer.transform(X)
+    def __init__(self, eps=1e-6):
+        self.eps = eps
 
-    # ==============================
-    # 2. 标准化
-    # ==============================
-    X_scaled = scaler.transform(X_imputed)
+    def _logit(self, proba):
+        p = np.clip(np.asarray(proba, dtype=float), self.eps, 1.0 - self.eps)
+        return np.log(p / (1.0 - p)).reshape(-1, 1)
 
-    # ==============================
-    # 3. 特征选择
-    # ==============================
-    if selector is not None:
-        X_selected = selector.transform(X_scaled)
-    else:
-        X_selected = X_scaled
+    def fit(self, proba, y):
+        model = LogisticRegression().fit(self._logit(proba), np.asarray(y).astype(int))
+        self.slope_ = float(model.coef_[0][0])
+        self.identity_ = self.slope_ <= 0
+        self.model_ = None if self.identity_ else model
+        return self
 
-    return X_selected
+    def predict(self, proba):
+        proba = np.asarray(proba, dtype=float)
+        if getattr(self, "identity_", True):
+            return proba
+        return self.model_.predict_proba(self._logit(proba))[:, 1]
+
+
+# 3. 按固定列名取特征（列缺失立刻报错，不做静默补零）
+def split_features(df, target_col="Potability"):
+
+    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"缺少特征列: {missing}")
+
+    X = df[FEATURE_COLUMNS].copy()
+    y = None if target_col not in df.columns else df[target_col]
+
+    return X, y
 
 
 # 4. 特征分析与可视化
@@ -123,7 +102,7 @@ def analyze_features(df, target_col="Potability"):
     plt.figure(figsize=(12, 8))
 
     sns.heatmap(
-        df.corr(),
+        df.corr(numeric_only=True),
         annot=True,
         cmap='coolwarm',
         fmt='.2f'
@@ -175,8 +154,6 @@ def analyze_features(df, target_col="Potability"):
 # 测试代码
 if __name__ == "__main__":
 
-    import os
-
     # 加载本地数据集
     file_path = "water_potability.csv"
 
@@ -186,13 +163,7 @@ if __name__ == "__main__":
 
     print("原始数据集形状：", df.shape)
 
-    # 拆分特征与标签
-    X = df.drop("Potability", axis=1)
-
-    y = df["Potability"]
-
-    # 拆分训练集和测试集
-    from sklearn.model_selection import train_test_split
+    X, y = split_features(df)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X,
@@ -202,34 +173,15 @@ if __name__ == "__main__":
         stratify=y
     )
 
-    # 在训练集上拟合预处理工具
-    (
-        X_train_processed,
-        y_train_processed,
-        imputer,
-        scaler,
-        selector,
-        features
-    ) = fit_preprocessing(
-        X_train,
-        y_train,
-        k_features=9,
-        method='anova'
-    )
+    # 只在训练集上拟合预处理链
+    preprocessor = build_preprocessor().fit(X_train, y_train)
 
-    print("预处理完成，最终特征：", features.tolist())
+    print("预处理完成，最终特征：",
+          preprocessor.named_steps['scaler'].get_feature_names_out().tolist())
 
-    print("训练集处理后形状：", X_train_processed.shape)
+    print("训练集处理后形状：", preprocessor.transform(X_train).shape)
 
-    # 转换测试集
-    X_test_processed = transform_data(
-        X_test,
-        imputer,
-        scaler,
-        selector
-    )
-
-    print("测试集处理后形状：", X_test_processed.shape)
+    print("测试集处理后形状：", preprocessor.transform(X_test).shape)
 
     # 特征分析
     analyze_features(df)
